@@ -1,0 +1,1040 @@
+---
+title: "NFL Offensive Play Prediction"
+author: "Dylan Henderson"
+date: "5/14/2021"
+output: html_document
+---
+
+```{r load-preprocess-data, include=FALSE}
+# Loading libraries
+library(nflfastR)
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(stringr)
+library(ggthemes)
+library(randomForest)
+library(rpart)
+library(gam)
+library(knitr)
+library(reshape2)
+library(maptree)
+
+# Setting global seed
+global_seed <- 42
+
+# Loading data
+future::plan("multisession")
+game_years <- 2019:2020
+pbp_original <- load_pbp(game_years)
+col_index <- c(3,6,8,10,12,15,17,22,26,28,29,31,32,34,35,36,54,55,60,284,294,296,330,332,333)
+
+master <- pbp_original[,col_index] %>%
+  filter(season == 2019 & season_type == "REG") %>%
+  select(-season, -season_type) %>%
+  filter(play_type %in% c("pass", "run")) %>%
+  mutate(posteam = factor(posteam),
+         defteam = factor(defteam, levels = levels(posteam))) %>%
+  rename(second_half = game_half) %>%
+  mutate(second_half = ifelse(second_half == "Half2", 1, 0)) %>%
+  filter(qb_kneel == 0 & qb_spike == 0) %>%
+  select(-qb_kneel, -qb_spike) %>%
+  mutate(play_type = case_when(
+    play_type == "run" & qb_scramble == 1 ~ "pass",
+    TRUE ~ play_type
+    )) %>%
+  mutate(pass_attempt = ifelse(play_type == "pass", 1, 0)) %>%
+  select(-play_type, -qb_scramble) %>%
+  mutate(play_clock = as.numeric(play_clock)) %>%
+  filter(play_clock %in% 0:40) %>%
+  select(old_game_id, desc, defteam, posteam, pass_attempt, down, ydstogo, yardline_100, second_half, half_seconds_remaining,
+         play_clock, score_differential, defteam_timeouts_remaining, posteam_timeouts_remaining, shotgun, no_huddle) %>%
+  na.omit()
+
+
+# Now we create a partition for the final validation set
+set.seed(global_seed, sample.kind = "Rounding")
+validation_ind <- createDataPartition(master$pass_attempt, times = 1, p = 0.15, list = FALSE)
+validation <- master[validation_ind,] %>% na.omit()
+dat <- master[-validation_ind,] %>% na.omit()
+rm(validation_ind)
+
+
+# Then partition the remaining data into training and test sets
+set.seed(global_seed, sample.kind = "Rounding")
+test_ind <- createDataPartition(master$pass_attempt, times = 1, p = 0.15, list = FALSE)
+dat_test <- dat[test_ind,] %>% na.omit()
+dat_train <- dat[-test_ind,] %>% na.omit()
+rm(test_ind)
+
+
+# Setting parameters to improve speed of cross validation
+k_folds <- 10
+control = trainControl(method = "cv", number = k_folds, p = 0.9)
+
+```
+# INTRODUCTION
+There is perhaps no country in the world that enjoys its sports quite like the United States. The "Big Four" are the most popular and longstanding sports leagues in the country, consisting of Major League Baseball (MLB), National Hockey League (NHL), National Basketball Association (NBA), and National Football League (NFL). All are multi-billion dollar businesses. And at a time where technology and innovation is permitting these fanbases to be accessed in more ways than ever before - take the streaming revolution and the liberalization of sports gambling, for example - operating a successful team has never been more important to franchise owners. 
+
+This is especially true for the NFL, which did nearly $16 billion in revenue in 2019, per Sports Business Journal. Furthermore, the league's revenue sharing agreement makes the financial incentive of fielding a competitive team even greater. "National" or "league-wide" revenues, such as those from ad sponsors and broadcasting deals with TV networks, are pooled and split evenly among the 32 teams, while "local" revenues (60% of ticket sales, concessions, merchandise, etc.) are not shared. This means local revenue is really where a given franchise's profitability upside lies. 
+
+One of the primary determinants of success in the National Football League is coaching and gameplanning - studying the upcoming opponent, developing a strategy to exploit their weaknesses, and executing on that strategy. In this paper, I attempt to predict decision-making in a key area of game management for NFL coaching staffs, the idea being that one who can reliably anticipate his opponent's moves will have a significant competitive advantage, win more football games, and ultimately yield greater profitability to his franchise. 
+
+Before going into more detail, I will take a moment to describe the rules/objectives of American football to fill in any knowledge gaps for the uninitiated. Each game is 60 minutes long, divided into four 15-minute quarters and two halves (i.e. two quarters per half). Like most other sports, the goal is to score more points than the opponent over this time. The field is 100 yards long and about 50 yards wide. At each end is a 10-yard long area called the endzone. Each team attempts to possess the football in the opponent's endzone, and when it does so, earns a "touchdown" worth 6 points. Behind each endzone is a tall, U-shaped structure called the field goal. A team can alternatively earn 3 points by kicking the football through the field goal. After a team scores, it then hands possession of the football back to the opposing team. 
+
+When in possession of the ball, a team is considered to be on offense. An offensive possession consists of "series." Each series, a team has four plays (called "downs") to advance the ball a total of 10 yards. If it does so, a new series begins at first down and ten yards to go; otherwise, it turns possession over to the opponent. Often, instead of attempting to gain yards on fourth down a team will elect to punt the ball downfield to the other team, sacrificing possession but pushing the opponent further away from their target endzone. On each down, a team can execute one of two plays. A "pass" occurs when one player attempts to throw the ball forwards to another player on his team. This is subject to numerous rules, but most importantly that the throwing player must be behind the "line of scrimmage," the point on the field where the play began, and that only one pass may occur during a given play. If the ball hits the ground before being caught, the play is over and no yards are gained or lost. The other type of play is a "run," which can simply be thought of as a play in which a pass does not occur. Instead, a team advances the ball forwards by carrying it while avoiding the defensive players who attempt to tackle the ball carrier. 
+
+While on defense, a team does its best to anticipate whether the offense will execute a pass or run on each play. If, for example, the defense is certain it will be a run, it will strategically put bigger, stronger players on the field who are better suited to defending runs. It may also concentrate these players closer to the line of scrimmage before the play begins. Similarly, there are other strategies employed specifically to defend pass plays. A successful offense will make it difficult for defenses to anticipate its playcalling decisions, opting for pass plays when the defense expects run, and vice versa. However, the challenge is balancing this unpredictability with the appropriate play type certain game situations call for. For example, since pass plays have much higher potential for big yardage gains, you will tend to see these more frequently when the offense must erase a significant deficit in a relatively short period of time. By contrast, run plays typically result in smaller gains, but with more certainty. You will therefore often see offenses call run plays in short yardage situations - when the line to gain for a first down or the endzone itself is within a few yards.
+
+To be clear, the models built over the course of this project do not aspire to make a judgment on which play an offense should choose, but rather, provide a probability estimate of the type of play that will occur next from the perspective of the defense, considering a wide variety of variables before the play begins. These variables are outlined and described below. Because we are making a probability estimate instead of a pure classification (i.e., run or pass), the appropriate metric of model strength will be the residual mean squared error or "RMSE." Actual outcomes will be denoted 1 for pass and 0 for run. This approach is a better reflection of this particular area of football decision-making than if we were forced to choose run/pass regardless of confidence level for one key reason: there exist hybrid defensive schemes that are suited to defend run and pass simultaneously. Such schemes are a double-edged sword, however, in that they generally are not as effective against run plays as a run-defense or as effective against a pass as a pass-defense. Standard/hybrid defenses are a hedge against an uncertain outcome, the offense's playcall. An effective play prediction model would reduce uncertainty and allow teams to opt for run/pass-specific defenses with at least as much frequency and at least as much accuracy. 
+
+The relevant dataset can be loaded into the R environment via the `nflfastR` package, which includes a set of functions to scrape NFL play-by-play data dating back to 1999. For this project, we will be looking at the 2019 NFL regular season (spanning September 2019 to January 2020), the most recent season available in the package. In the next section, I will discuss several important steps in preprocessing the data. After this step was performed, there were 17 columns and over 33,000 rows remaining in the dataset. Some columns were maintained as helpful references throughout the assignment. For example, a description of the play from which the other features were derived:
+
+```{r description-example}
+master$desc[5]
+
+```
+
+As you can see, the description contains key pieces of information, in this case, the passer, the receiver, yards gained, result of the play, and even a declined penalty on the defense. Below is a full list of the columns, in addition to the play description.
+
+```{r variable-descriptions, echo=FALSE}
+variable_descriptions <- data.frame(Variable_Description = c(
+  "Unique numeric identifier for individual games.",
+  "Play description.",
+  "Team on defense.",                                  
+  "Team on offense (i.e. team with possession of football before play begins).",
+  "Boolean variable - 1 if offense executes a pass play, 0 if run play.",
+  "Down number before play begins.",
+  "Distance between line of scrimmage and line to gain for a first down.",
+  "Position of the line of scrimmage, the point on the field where the play begins. Equivalently, the offense's distance from the opponent's endzone.",
+  "Boolean variable - 1 if game is in second half, 0 if game is in first half.",
+  "Number of seconds remaining in the half.",
+  "Number of seconds remaining on the play clock. The offense is allowed 40 seconds in between plays, outside of any other stoppages such as a timeout.",
+  "Difference in point total, offense vs. defense. Positive means offense is ahead, negative means offense is trailing.",
+  "Defense's number of timeouts remaining (each team has three per half). These can be used to strategically preserve time by pausing the game clock until the next play begins. This can be extremely important at the end of the game, particularly when the offensive team is trailing.",
+  "Offense's number of timeouts remaining",
+  "Boolean variable - 1 if offense is in shotgun formation. This means the quarterback is several yards behind the center and receives the snap via toss rather than direct hand-to-hand exchange.",
+  "Boolean variable - 1 if offense did not huddle before the play, 0 otherwise. This is traditionally a tactic used by an offense to preserve time on the game clock."
+  ))
+
+dataset_description <- data.frame(Variable = names(master),
+                                  sample_value = master[5,] %>% as.matrix() %>% t() %>% as.vector()) %>%
+  mutate(`Variable Description` = variable_descriptions$Variable_Description) %>%
+  rename(`Sample Value` = sample_value)
+
+kable(dataset_description)
+```
+
+Once cleaned and partitioned, I was able to perform some exploratory analysis to assess the validity of some of the patterns in the data I expected to see, based on preexisting knowledge of football. Equipped with new insights from this exercise, I then fitted several different models to the data, evaluated their performance based on the resulting RMSE in the test set, then made final predictions on the validation set. Lastly, I attempt to put into context the significance of the best model's performance by making predictions on new observations from the 2017 season, for which there was available information on the defensive schemes such as player personnel by position group. Using this information, I infer what type of play the defensive team was expecting and compare this against the actual outcomes. I then design an algorithm for the best performing model which would achieve strictly better results than the baseline. 
+
+
+# DATA LOADING & PRE-PROCESSING
+
+The first step was loading the relevant data into the R environment, which was done easily through the `nflfastR` package. The dataset originates with nearly 100,000 observations of 370 variables. The first challenge was therefore reducing the columns to only those which were relevant for my analysis or for helping determine which observations did not meet the criteria for belonging in training/test/validation sets. We create a column index to do so:
+
+```{r loading-data, eval=FALSE}
+# Loading data for games occurring in the years 2019 and 2020
+future::plan("multisession")
+game_years <- 2019:2020
+pbp_original <- load_pbp(game_years)
+
+# Filtering out all the unneeded columns
+col_index <- c(3,6,8,10,12,15,17,22,26,28,29,31,32,34,35,36,54,55,60,284,294,296,330,332,333)
+master <- pbp_original[,col_index]
+```
+
+
+Next the objective was filtering out the unneeded rows. For example, some included observations from playoff games or games from the 2020 season.
+```{r preprocess-season-year, eval=FALSE}
+# We only want 2019 regular season games
+master <- master %>%
+  filter(season == 2019 & season_type == "REG") %>%
+  select(-season, -season_type)
+```
+
+
+Other rows did not represent plays with outcomes of "run" or "pass." Two examples of this are quarterback kneels and quarterback spikes. Kneels occur at the end of games as formalities to run off the remaining time on the clock when the possession team is leading. Spikes occur when the possession team needs to stop the game clock near the end of a game without using a timeout. It's not necessary for a defense to predict these plays, and moreover, it is not accurate to account for these as runs and passes, respectively. 
+```{r preprocess-play-type, eval=FALSE}
+# Filtering out QB spikes and QB kneels
+master <- master
+  filter(play_type %in% c("pass", "run")) %>%
+  filter(qb_kneel == 0 & qb_spike == 0) %>%
+  select(-qb_kneel, -qb_spike)
+```
+
+
+Similarly, it was necessary to recode observations whose run/pass outcome did not reflect the actual play design, which is what we are trying to predict. For instance, quarterback scrambles are pass plays where the quarterback goes "off-script" and decides to run the ball himself rather than abide by the original play design. Such plays were originally accounted for as runs and needed to be updated.
+```{r preprocess-scramble, eval=FALSE}
+# Changing QB scrambles to reflect the intended play design
+master <- master %>%
+  mutate(play_type = case_when(
+    play_type == "run" & qb_scramble == 1 ~ "pass",
+    TRUE ~ play_type
+    ))
+```
+
+
+Some observations simply had input errors. For example, the play clock (the maximum amount of time an offense may take in between plays) cannot exceed 40 seconds, however some rows had values beyond this range. These cases were rare and there was no clear pattern of how the errors were made, so they were removed from the dataset. 
+```{r preprocess-playclock, eval=FALSE}
+# Filtering out rows with play clock values outside the possible range
+master <- master %>%
+  filter(play_clock %in% 0:40)
+```
+
+
+Other steps in this process entailed recoding columns to more appropriate classes and removing rows with missing data.
+```{r preprocess-class-change, eval=FALSE}
+# Changing posteam and defteam to factors; removing leftover rows with information gaps
+master <- master %>%
+  mutate(posteam = factor(posteam),
+         defteam = factor(defteam, levels = levels(posteam)))
+  na.omit()
+```
+
+
+Let's check that each feature is meaningful. 
+```{r nzv}
+# Will return TRUE if there are columns with near zero variance, in which case we would need to remove them
+any(nearZeroVar(master))
+```
+
+
+We have confirmed there are no columns with near zero variance. And finally, let's examine correlation among the numeric features. 
+```{r feature-correlation, echo=FALSE, fig.align="center"}
+# Creating matrix of correlations between each combination of features
+cormat <- round(cor(master[,6:16]), 2)
+
+# Function we will use on the above matrix to prevent redundant combinations from being plotted
+upper_triangle <- function(cormat){
+  cormat[upper.tri(cormat)] <- NA
+  return(cormat)
+}
+
+upper_tri <- upper_triangle(cormat)
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+
+melted_cormat %>% ggplot(aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile(color = "black") + 
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name = "Correlation") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  ggtitle("Correlation between Numeric Features") +
+  xlab("") + 
+  ylab("")
+```
+
+
+No red flags from the above plot - all features are sufficiently independent of one another. Now we can feel confident the data is clean and ready for partitioning. 
+```{r partitioning, eval=FALSE}
+# Setting global seed - to ensure consistency throughout script
+global_seed <- 42
+
+# Creating a partition for the final validation set. We will only use these observations for evaluating the final models. 
+set.seed(global_seed, sample.kind = "Rounding")
+validation_ind <- createDataPartition(master$pass_attempt, times = 1, p = 0.15, list = FALSE)
+validation <- master[validation_ind,] %>% na.omit()
+dat <- master[-validation_ind,] %>% na.omit()
+rm(validation_ind)
+
+# Creating training/test sets with the non-validation data
+set.seed(global_seed, sample.kind = "Rounding")
+test_ind <- createDataPartition(master$pass_attempt, times = 1, p = 0.15, list = FALSE)
+dat_test <- dat[test_ind,] %>% na.omit()
+dat_train <- dat[-test_ind,] %>% na.omit()
+rm(test_ind)
+
+```
+
+
+
+# MEHTODS & ANALYSIS
+The natural place to begin the analysis is by looking at the overall prevalence of run plays and pass plays. These rates will add up to one since we have filtered out all observations which do not result in either of these outcomes. 
+```{r pass-frequency, echo=FALSE, message=FALSE}
+# Finding overall pass/run rates
+dat_train %>%
+    group_by(pass_attempt) %>%
+    summarize(n = n()) %>%
+    mutate(Frequency = prop.table(n)) %>% 
+    select(-n)
+```
+
+
+Now based on these rates, we can come up with a naive model which estimates the probability of a pass to be approximately 62% on every single play. This can be thought of as the first level of complexity after guessing 50% on each play, since there are only two possible outcomes, which would yield a RMSE of 0.5. We will therefore use this as the baseline for comparison.
+```{r naive-model}
+# Obtaining pass rate and predicting this across all observations in test set
+pass_frequency <- mean(dat_train$pass_attempt == 1)
+phat_naive <- rep(pass_frequency, nrow(dat_test))
+rmse_naive <- RMSE(phat_naive, dat_test$pass_attempt)
+```
+
+```{r test-results, echo=FALSE, warning=FALSE}
+# Initializing dataframe where we will store results
+test_results_df <- data.frame(Model = "Naive", RMSE = rmse_naive)
+
+test_results_df %>% mutate(`Relative to Baseline` = (RMSE - 0.5)/0.5) %>%
+  arrange(`Relative to Baseline`) %>%
+  mutate_at(.vars = vars(RMSE, `Relative to Baseline`), .funs = funs(round(., 3))) %>%
+  kable()
+```
+
+
+We can go deeper in the analysis and examine correlation between the individual numeric features (i.e., all except for `posteam` and `defteam`, the teams on offense and defense) and `pass_attempt`, the outcome. 
+```{r feature-correlation-with-pass, echo=FALSE, fig.align="center"}
+cor(dat_train[,5], dat_train[,6:16]) %>% 
+    as.data.frame() %>% 
+    gather(key = "Feature", value = "Correlation") %>%
+    ggplot(aes(x = reorder(Feature, Correlation), y = Correlation, fill = Correlation)) + 
+    geom_bar(stat = "identity", color = "black") +
+    theme_minimal() + 
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1,1), space = "Lab", 
+                         name = "Correlation") +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+          axis.title.x = element_blank(),
+          axis.text.y = element_blank()) + 
+    ggtitle("Feature Correlation with Pass Attempt")
+```
+
+
+The highest absolute correlation belongs to `shotgun`. This is not surprising, given that plays in shotgun formation are overwhelmingly passes. `down` also has a high correlation. Teams facing third down must reach the line to gain for a first down or else be forced to punt the ball and turn possession over to the opposition. Similarly, teams that decide to "go for it" on fourth down must reach the line to gain or else turn the ball over at the spot of the ball, by rule. Because of these severe consequences, and because pass plays inherently have potential for larger gains, teams tend to pass on later downs. 
+
+We might also suspect there is an interaction between `ydstogo` and `down`. As an extreme example, consider the difference between 1st down and 10 yards to go and 3rd and 10. On first down, a team is guaranteed at least two more attempts to reach the line to gain, whereas on third down it is realistically the team's last shot. Therefore, teams will probably be passing on 3rd and 10 much more frequently than on 1st and 10. This is evident in the below plot when we compare pass rates in equivalent yardage situations across different downs. On first down and long (defined here as `ydstogo` in the range of 10-15), teams pass about half the time, whereas on third or fourth down and long they pass virtually all the time. Note that the numbers at the top of each bar refer to case size.
+```{r down-distance-pass-rate, echo=FALSE, message=FALSE, fig.align="center"}
+dat_train %>%
+    mutate(yardage_situation = case_when(
+        ydstogo %in% 1:2 ~ "short",
+        ydstogo %in% 3:5 ~ "medium-short",
+        ydstogo %in% 6:9 ~ "medium-long",
+        ydstogo %in% 10:15 ~ "long",
+        TRUE ~ "very long"
+    ) %>% factor(levels = c("short", "medium-short", "medium-long", "long", "very long"))) %>%
+    group_by(down, yardage_situation) %>%
+    summarize(pass_frequency = mean(pass_attempt), n = n()) %>%
+    ggplot(aes(x = yardage_situation, y = pass_frequency, fill = factor(down))) + 
+    geom_bar(stat = "identity", color = "black") + 
+    facet_grid(down~.) + 
+    scale_y_continuous(labels = scales::percent) +
+    theme_minimal() +
+    geom_hline(yintercept = 0.5, linetype = "dotted") +
+    ggtitle("Pass Rate vs. Down + Distance") +
+    xlab("Yardage Situation") +
+    ylab("Pass Rate") +
+    labs(fill = "Down") +
+    geom_label(aes(label = n), size = 3)
+```
+
+
+When we account for `shotgun`, we see some interesting changes.
+```{r down-distance-shotgun-pass-rate, echo=FALSE, message=FALSE, fig.align="center"}
+dat_train %>%
+    mutate(yardage_situation = case_when(
+        ydstogo %in% 1:2 ~ "short",
+        ydstogo %in% 3:5 ~ "medium-short",
+        ydstogo %in% 6:9 ~ "medium-long",
+        ydstogo %in% 10:15 ~ "long",
+        TRUE ~ "very long"
+    ) %>% factor(levels = c("short", "medium-short", "medium-long", "long", "very long")),
+    shotgun = ifelse(shotgun == 1, "Shotgun", "Not Shotgun")) %>%
+    group_by(down, yardage_situation, shotgun) %>%
+    summarize(pass_frequency = mean(pass_attempt), n = n()) %>%
+    ggplot(aes(x = yardage_situation, y = pass_frequency, fill = factor(down))) + 
+    geom_bar(stat = "identity", color = "black") + 
+    facet_grid(down~shotgun) + 
+    scale_y_continuous(labels = scales::percent) +
+    theme_minimal() +
+    geom_hline(yintercept = 0.5, linetype = "dotted") +
+    ggtitle("Pass Rate vs. Down + Distance") +
+    xlab("Yardage Situation") +
+    ylab("Pass Rate") +
+    labs(fill = "Down") +
+    geom_label(aes(label = n), size = 3)
+```
+
+Most notably, third down pass rates are highly polarized, with shotgun formation overwhelmingly resulting in passes, and fairly constant across different yardages. We can first try fitting a logistic model to a linear combination of these variables.
+```{r logit-model-test}
+fit_logit_downdist <- glm(pass_attempt ~ down + ydstogo + shotgun, data = dat_train, family = "binomial")
+phat_logit_downdist <- predict(fit_logit_downdist, dat_test, type = "response")
+rmse_logit_downdist <- RMSE(phat_logit_downdist, dat_test$pass_attempt)
+```
+
+
+And already we see an substantial improvement over the naive model.
+```{r test-results-2, echo=FALSE}
+test_results_df <- test_results_df %>%
+  rbind(data.frame(Model = "Logit - Down + Distance + Shotgun", RMSE = rmse_logit_downdist))
+
+test_results_df %>% mutate(`Relative to Baseline` = (RMSE - 0.5)/0.5) %>%
+  arrange(`Relative to Baseline`) %>%
+  mutate_at(.vars = vars(RMSE, `Relative to Baseline`), .funs = funs(round(., 3))) %>%
+  kable()
+```
+
+
+We saw, however, that after controlling for shotgun formation the pass rate distributions were reasonably non-linear. Perhaps we can improve upon the logistic regression model with a more flexible approach such as local-weighted regression. 
+```{r loess-model-test, warning=FALSE}
+# Training loess model to optimize span parameter
+fit_loess_downdist <- train(factor(pass_attempt, levels = 1:0) ~ down + ydstogo + shotgun, data = dat_train, method = "gamLoess",
+                  tuneGrid = data.frame(span = seq(0.05, 0.55, 0.1), degree = 1))
+
+phat_loess_downdist <- predict(fit_loess_downdist, dat_test, type = "prob") %>% as.data.frame() %>% pull(`1`)
+
+rmse_loess_downdist <- RMSE(phat_loess_downdist, dat_test$pass_attempt)
+```
+
+
+The loess model does improve upon the logistic model, but only slightly.
+```{r test-results-3, echo=FALSE}
+test_results_df <- test_results_df %>%
+  rbind(data.frame(Model = "Loess - Down + Distance + Shotgun", RMSE = rmse_loess_downdist))
+
+test_results_df %>% mutate(`Relative to Baseline` = (RMSE - 0.5)/0.5) %>%
+  arrange(`Relative to Baseline`) %>%
+  mutate_at(.vars = vars(RMSE, `Relative to Baseline`), .funs = funs(round(., 3))) %>%
+  kable()
+```
+
+
+There must be more complex structures in the data which are not being captured by these simple models with only a few variables, even if these three do explain most of the variation we see in the outcome variable. More sophisticated models are needed to accommodate this. 
+
+A K-nearest neighbors model seems like it suits this purpose quite well has the additional benefit of being easily interpretable. It answers the question, "in similar game situations to the one I am predicting, how frequently have teams chosen a pass play?". But, with 11 different numeric variables available to us, there are over 2,000 different combinations of these variables to choose from. How should we be defining the most similar or "nearest" situations? In other words, how should we decide which features are relevant and should be used in the model?
+
+To answer this question, I trained a K-nearest neighbors model for each possible combination of at least nine features, for a total of 67 different models (55 of which included nine features, 11 of which included 10 features, and of course one that included all 11.) 
+
+The first step was to create a list containing all combinations of features, then coerce those combinations into formulas.
+```{r knn-feature-selection}
+# Creating vector of each of the feature names
+feature_names <- c("down", "ydstogo", "yardline_100", "second_half", "half_seconds_remaining", "play_clock", "score_differential", "defteam_timeouts_remaining", "posteam_timeouts_remaining", "shotgun", "no_huddle")
+
+# Using the vector above to create an 11-element list
+# Each element in the list is a matrix of the different combination of features for a given length
+# For example: the first element is of length 11 choose 1 (= 11), the second element is of length 11 choose 2 (= 55), and so on
+feature_combinations <- sapply(1:length(feature_names), function(m){
+  combn(x = feature_names[1:11], m)
+})
+
+
+# Coercing the underlying vectors into formulas using a nested for loop
+# The index i represents the 11 different number of features we can possibly choose out of 11
+# The index j represents the number of feature combinations within that number
+# k is a placeholder to make sure one list entry is created for each unique combination
+feature_combinations_vFormula <- list()
+k <- 0
+
+for(i in 1:length(feature_combinations)) {
+  temp <- feature_combinations[[i]]
+  for(j in 1:ncol(temp)) {
+    k <- k + 1
+    feature_combinations_vFormula[[k]] <- formula(paste("pass_attempt", "~", paste(temp[,j], collapse = " + ")))
+  }
+}
+```
+
+
+We can now use this list of formulas to train models. We know we want the last 67 formulas in this list, but we will have to check its length to know where to begin indexing.
+```{r knn-number-of-combinations}
+length(feature_combinations_vFormula)
+```
+
+
+And so we know indices 1981 through 2047 contain all the formulas with at least nine features. We can train a K-nearest neighbor model on each within a for loop, and within the same loop, make pass probability estimates on the test set and find the resulting RMSE.
+```{r knn-model-training-and-predictions, warning=FALSE}
+# Initializing lists for the models and their predictions on the test set
+knn_models_list <- list()
+knn_model_predictions <- list()
+
+# Training 67 knn models
+# Note that a key step in the call to train() is centering and scaling the data so they are of equal weight
+for(i in 1:67) {
+  knn_models_list[[i]] <- train(feature_combinations_vFormula[[i + 1980]], data = dat_train, method = "knn",
+                                tuneGrid = data.frame(k = seq(20,80,20)), trControl = control, preProcess = c("center", "scale"))
+  
+  knn_model_predictions[[i]] <- predict(knn_models_list[[i]], dat_test)
+}
+
+# Creating matrix of probability estimates - 67 columns for each model and 4065 rows for each observation in the test set
+# Then using each column in the matrix to calculate a RMSE
+knn_model_predictions <- matrix(unlist(knn_model_predictions), ncol = 67)
+combination_rmse <- apply(X = knn_model_predictions[,1:67], MARGIN = 2, FUN = function(v) RMSE(v, dat_test$pass_attempt))
+```
+
+
+The importance of feature selection is evident when we plot all of the RMSEs, which range from roughly 0.416 to 0.458 - a spread of nearly 10%. The index of each model in the list is on the x-axis, and its corresponding RMSE is on the y-axis. Stronger models are found at the bottom.
+```{r knn-models-rmse-plot, echo=FALSE, fig.align="center"}
+plot(1:67, combination_rmse)
+```
+
+
+To determine which features we should maintain, we can plot a matrix of the combinations of omitted features and the RMSE for that particular model. We would expect the RMSE to decrease when a weak feature is omitted from the model (highlighted in red) and to increase when a strong feature is omitted (highlighted in green). The effect of removing just one feature is shown in the bottom row, with the exception of the box furthest to the right which represents a model with no features removed.
+```{r knn-features-heatmap, echo=FALSE, fig.align="center"}
+# Creating dataframe of excluded feature combinations and corresponding knn model RMSE
+temp <- data.frame(excluded_feature1 = 0, excluded_feature2 = 0, model_rmse = 0)
+for(i in 1:67){
+  feature1 <- setdiff(feature_names, knn_models_list[[i]]$coefnames)[1]
+  feature2 <- setdiff(feature_names, knn_models_list[[i]]$coefnames)[2]
+  rmse <- combination_rmse[i]
+  temp <- rbind(temp, data.frame(excluded_feature1 = ifelse(is.na(feature1), "none", feature1),
+                                 excluded_feature2 = ifelse(is.na(feature2), "none", feature2),
+                                 model_rmse = rmse))
+}
+
+# Reshaping dataframe for plot. We will need to reorder features according to how many times it was the first/second excluded feature.
+temp <- slice(temp, -1) %>%
+  group_by(excluded_feature1) %>%
+  mutate(n1 = n()) %>%
+  ungroup() %>%
+  group_by(excluded_feature2) %>%
+  mutate(n2 = n()) %>%
+  ungroup()
+  
+temp %>%
+    ggplot(aes(x = reorder(excluded_feature1, -n1), y = reorder(excluded_feature2, -n2), fill = model_rmse)) +
+    geom_tile(color = "black") + 
+    theme_minimal() + 
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), 
+          panel.grid.major = element_blank()) + 
+    scale_fill_gradient2(low = "red", high = "green", mid = "white", midpoint = median(temp$model_rmse), limit = range(temp$model_rmse), space = "Lab", 
+                         name = paste("Feature Strength", "(Model RMSE)", sep = "\n")) +
+    xlab("First Excluded Feature") + 
+    ylab("Second Excluded Feature")
+```
+
+
+The strongest features seem to be `shotgun`, `down`, and `ydstogo`; the weakest are `defteam_timeouts_remaining`, `posteam_timeouts_remaining`, `play_clock`, `no_huddle`, and, somewhat surprisingly, `yardline_100`. To be conservative, we will take a top-down approach and drop only the weakest features while maintaining the rest.
+```{r knn-model-test, warning=FALSE}
+# Training knn model with unhelpful features removed, predicting on the test set, and calculating RMSE of predictions
+fit_knn <- train(pass_attempt ~ down + ydstogo + shotgun + half_seconds_remaining + score_differential + second_half,
+                 data = dat_train, method = "knn", tuneGrid = data.frame(k = seq(20,80,10)), preProcess = c("center", "scale"),
+                 trControl = control)
+
+phat_knn <- predict(fit_knn, dat_test)
+
+rmse_knn <- RMSE(phat_knn, dat_test$pass_attempt)
+```
+
+
+The final K-nearest model is a substantial improvement from the previous models. 
+```{r test-results-4, echo=FALSE}
+test_results_df <- test_results_df %>%
+  rbind(data.frame(Model = "KNN", RMSE = rmse_knn))
+
+test_results_df %>% mutate(`Relative to Baseline` = (RMSE - 0.5)/0.5) %>%
+  arrange(`Relative to Baseline`) %>%
+  mutate_at(.vars = vars(RMSE, `Relative to Baseline`), .funs = funs(round(., 3))) %>%
+  kable()
+```
+
+Also note that the final K-nearest neighbors model performs better than any of other 67 KNN models we had already trained, including the one with all 11 features, so the feature selection exercise was worthwhile.
+```{r knn-models-best-rmse}
+# Index 67 of combination_rmse 
+print(round(min(combination_rmse),3))
+```
+
+
+The fact that omitting `half_seconds_remaining`, `second_half`, and `score_differential` on their own did not significantly increase the RMSE of the KNN model while simultaneously omitting any two of them did highlights an important aspect of the data: that some features in combination with one another can offer meaningful predictive value. For example, across all observations in the training set, whether the respective game is in its second half does not say much about the likelihood of a pass.
+```{r second-half-pass-rate, message=FALSE}
+# Pass rates in first and second half
+dat_train %>% group_by(second_half) %>% summarize(n = n(), pass_rate = mean(pass_attempt))
+```
+
+
+But, when we know the team on offense is trailing, has the ball inside its own 20 yardline, and there are less than two minutes remaining in the half, whether the game is in the second half makes a huge difference with respect to pass probability.
+```{r second-half-pass-rate-2, message=FALSE}
+# Pass rates in first and second half + less than 2 minutes in half + when offense is inside its own 20 yardline
+dat_train %>% 
+    filter(half_seconds_remaining <= 120 & score_differential < 0 & yardline_100 >= 80) %>%
+    group_by(second_half) %>% 
+    summarize(n = n(), pass_rate = mean(pass_attempt))
+```
+
+
+It's easy to imagine an extreme case such as this, but perhaps a regression tree can account for relationships that are less obvious or intuitive. A regression tree also has the benefit of being able to include non-numeric variables, in this case, the offensive team (`posteam`) and defensive team (`defteam`).
+
+We can first optimize the complexity parameter and minsplit parameter simultaneously using `sapply()`.
+```{r rpart-model-parameter-optimization, warning=FALSE}
+# Creating the different ranges of possible values for minsplit and cp
+minsplit_values <- seq(2, 50, len = 20)
+cp_values <- seq(0, 0.01, len = 10)
+
+# Calculating RMSE of different cp/minsplit combinations
+rmse_minsplit_cp <- sapply(minsplit_values, function(ms) {
+  train(x = dat_train[,c(3:4,6:16)], y = dat_train$pass_attempt, method = "rpart",
+        tuneGrid = data.frame(cp = cp_values), control = rpart.control(minsplit = ms), trControl = control)$results[["RMSE"]]
+})
+
+# Choosing the cp and minsplit which minimize RMSE
+best_cp <- cp_values[which(rmse_minsplit_cp == min(rmse_minsplit_cp), arr.ind = TRUE)[,1]]
+best_minsplit <- minsplit_values[which(rmse_minsplit_cp == min(rmse_minsplit_cp), arr.ind = TRUE)[,2]]
+```
+
+
+And then train the final model using the optimized parameters.
+```{r rpart-model-test, warning=FALSE}
+fit_rpart <- rpart(pass_attempt ~ defteam + posteam + down + ydstogo + yardline_100 + second_half + half_seconds_remaining + play_clock + 
+                     score_differential + defteam_timeouts_remaining + posteam_timeouts_remaining + shotgun + no_huddle,
+                   data = dat_train, control = rpart.control(minsplit = best_minsplit, cp = best_cp))
+
+phat_rpart <- predict(fit_rpart, dat_test)
+
+rmse_rpart <- RMSE(phat_rpart, dat_test$pass_attempt)
+```
+
+
+Let's take a look at the regression tree that the model constructed. 
+```{r regression-tree-plot, echo=FALSE, fig.align = "center"}
+draw.tree(fit_rpart, print.levels = FALSE, digits = 2, size = 2, nodeinfo = FALSE, cases = "", cex = 0.5)
+```
+
+
+Numbered circles represent the 27 different terminal nodes, the next number down represents pass probability, and the bottom number represents total observations within the terminal node from which the pass probability was calculated. One thing that stands out in the plot is the fact that a handful of features were not utilized at all: `no_huddle`, `play_clock`, `second_half`, `posteam_timeouts_remaining`, and `defteam_timeouts_remaining`. These are in fact the very same features we decided to exclude from the K-nearest neighbors model.
+
+Although the regression tree is able to make use of new features in `posteam` and `defteam`, unlike K-nearest neighbors, it fails to improve our RMSE.
+```{r test-results-5, echo=FALSE}
+test_results_df <- test_results_df %>%
+  rbind(data.frame(Model = "Regression Tree", RMSE = rmse_rpart))
+
+test_results_df %>% mutate(`Relative to Baseline` = (RMSE - 0.5)/0.5) %>%
+  arrange(`Relative to Baseline`) %>%
+  mutate_at(.vars = vars(RMSE, `Relative to Baseline`), .funs = funs(round(., 3))) %>%
+  kable()
+```
+
+
+The final model we will try fitting to the data is a random forest. This may be a more effective way of extracting information out of the features K-nearest neighbors and the regression tree have essentially ignored through the random nature by which each individual decision tree in the forest is created. Put differently, since only a subset of features is considered at each node split, there is better likelihood that the previously neglected features will be selected and inform the model's predictions, however minimally. 
+
+Similar to the regression tree, we can optimize parameters simultaneously using `sapply()`. In this case, the two parameters are `nodesize`, the minimum number of observations within a node for it to be split, and `mtry`, the number of features to be considered at each split.
+```{r rf-parameter-optimization, warning=FALSE}
+# Setting different possible values for nodesize
+# Note that the same is done directly within the call to train() for mtry
+rf_nodesize = seq(50,150,25)
+
+# Creating matrix of different RMSEs, which can then be indexed to find the optimal parameter combination
+rmse_nodesize <- sapply(rf_nodesize, function(ns){
+  train(x = dat_train[,c(3:4,6:16)], y = dat_train$pass_attempt, method = "rf", 
+        nodesize = ns, tuneGrid = data.frame(mtry = 2:5), trControl = control, ntree = 300)$results[["RMSE"]]
+})
+
+# These are our optimized parameters that we will use in the final model
+best_nodesize <- rf_nodesize[which(rmse_nodesize == min(rmse_nodesize), arr.ind = TRUE)[2]]
+best_mtry <- c(2:5)[which(rmse_nodesize == min(rmse_nodesize), arr.ind = TRUE)[1]]
+```
+
+
+With `nodesize` and `mtry` optimized, we can now train the final model.
+```{r rf-model-test, warning=FALSE}
+fit_rf <- randomForest(x = dat_train[,c(3:4,6:16)], y = dat_train$pass_attempt, nodesize = best_nodesize, mtry = best_mtry,
+                       ntree = 300)
+
+phat_rf <- predict(fit_rf, dat_test)
+
+rmse_rf <- RMSE(phat_rf, dat_test$pass_attempt)
+```
+
+
+We have succeeded in improving upon the K-nearest neighbors model.
+```{r test-results-6}
+test_results_df <- test_results_df %>%
+  rbind(data.frame(Model = "Random Forest", RMSE = rmse_rf))
+
+test_results_df %>% mutate(`Relative to Baseline` = (RMSE - 0.5)/0.5) %>%
+  arrange(`Relative to Baseline`) %>%
+  mutate_at(.vars = vars(RMSE, `Relative to Baseline`), .funs = funs(round(., 3))) %>%
+  kable()
+```
+
+# FINAL RESULTS
+For the sake of comparison, we make final predictions using all five models. To make as much use of the data we can, we will also retrain the models on the full dataset (i.e., the former training and test sets). Below is the summary of how the final models performed on the validation set.
+```{r retraining-models, echo=FALSE, warning=FALSE, message=FALSE}
+# Model #1: naive baseline
+rmse_naive_validation <- RMSE(rep(pass_frequency, nrow(validation)), validation$pass_attempt)
+
+# Model #2
+fit_logit_downdist_final <- glm(pass_attempt ~ down + ydstogo + shotgun, data = dat, family = "binomial")
+phat_logit_downdist_validation <- predict(fit_logit_downdist_final, validation, type = "response")
+rmse_logit_downdist_validation <- RMSE(phat_logit_downdist_validation, validation$pass_attempt)
+
+
+# Model #2b
+fit_loess_downdist_final <- train(factor(pass_attempt, levels = 1:0) ~ down + ydstogo + shotgun, data = dat, method = "gamLoess",
+                            tuneGrid = data.frame(span = seq(0.05, 0.55, 0.1), degree = 1))
+phat_loess_downdist_validation <- predict(fit_loess_downdist_final, validation, type = "prob") %>% as.data.frame() %>% pull(`1`)
+rmse_loess_downdist_validation <- RMSE(phat_loess_downdist_validation, validation$pass_attempt)
+
+# Model #3 
+fit_knn_final <- train(pass_attempt ~ down + ydstogo + half_seconds_remaining + score_differential + shotgun + second_half,
+                 data = dat, method = "knn", tuneGrid = data.frame(k = seq(20,140,20)), preProcess = c("center", "scale"),
+                 trControl = control)
+phat_knn_validation <- predict(fit_knn_final, validation)
+rmse_knn_validation <- RMSE(phat_knn_validation, validation$pass_attempt)
+
+# Model #4: regression tree
+fit_rpart_final <- rpart(pass_attempt ~ defteam + posteam + down + ydstogo + yardline_100 + second_half + half_seconds_remaining + play_clock + 
+                     score_differential + defteam_timeouts_remaining + posteam_timeouts_remaining + shotgun + no_huddle,
+                   data = dat, control = rpart.control(minsplit = best_minsplit, cp = best_cp))
+phat_rpart_validation <- predict(fit_rpart_final, validation)
+rmse_rpart_validation <- RMSE(phat_rpart_validation, validation$pass_attempt)
+
+# Model #5: random forest
+fit_rf_final <- randomForest(x = dat[,c(3:4,6:16)], y = dat$pass_attempt, nodesize = best_nodesize, mtry = best_mtry,
+                       ntree = 300)
+phat_rf_validation <- predict(fit_rf_final, validation)
+rmse_rf_validation <- RMSE(phat_rf_validation, validation$pass_attempt)
+
+# Summary of final predictions
+validation_results_summary <- data.frame(model = c("Naive", "Logit - Down + Distance + Shotgun", "Loess - Down + Distance + Shotgun", 
+                                                   "KNN", "Regression Tree", "Random Forest"),
+                                         RMSE = c(rmse_naive_validation, rmse_logit_downdist_validation, rmse_loess_downdist_validation, 
+                                                  rmse_knn_validation, rmse_rpart_validation, rmse_rf_validation))
+
+validation_results_summary %>% mutate(`Relative to Baseline` = (RMSE - 0.5)/0.5) %>%
+  arrange(`Relative to Baseline`) %>%
+  mutate_at(.vars = vars(RMSE, `Relative to Baseline`), .funs = funs(round(., 3))) %>%
+  kable()
+```
+
+
+A way to visually evaluate the model predictions would be to examine their prediction distributions when we know the true outcomes. In the plot below, a perfect model would have all of its predictions in red (run plays) to the left of the dotted line and all predictions in blue (pass plays) to the right of the line. More specifically, since we are evaluating on RMSE instead of just accuracy, a perfect model would have all of its predictions at the extremes - predicting 0% chance of pass for run plays and 100% chance of pass for pass plays. From the plot, it is clear that the better performing models, located toward the bottom, do a better job of separating predictions into the appropriate sides. 
+```{r validation-phat-distributions, echo=FALSE, fig.align = "center"}
+# Storing probability estimates in dataframe
+validation_plus_phats <- data.frame(logit = phat_logit_downdist_validation,
+                   loess = phat_loess_downdist_validation,
+                   knn = phat_knn_validation,
+                   rpart = phat_rpart_validation,
+                   rf = phat_rf_validation) %>%
+  cbind(validation)
+
+validation_plus_phats %>% select(logit, loess, knn, rpart, rf, pass_attempt) %>%
+  gather(key = "model", value = "phat", -pass_attempt) %>%
+    mutate(pass_attempt = ifelse(pass_attempt == 1, "Actual Pass", "Actual Run") %>% factor(levels = c("Actual Run", "Actual Pass")),
+           model = factor(model, levels = c("logit", "loess", "rpart", "knn", "rf"))) %>%
+    ggplot(aes(x = phat, fill = pass_attempt)) + 
+    geom_histogram(binwidth = 0.05, color = "black", aes(y = 0.05*..density..)) +
+    facet_grid(model~pass_attempt) +
+    theme_minimal() +
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          legend.position = "none") + 
+    geom_vline(xintercept = 0.5, linetype = "dotted") + 
+    scale_x_continuous(labels = scales::percent) +
+    scale_y_continuous(labels = scales::percent, breaks = c(0, 0.15,0.3)) +
+    ylab("Proportion by Group") +
+    xlab("Pass Probability Estimate") + 
+    ggtitle("Model Prediction Distributions")
+```
+
+
+We can also look at model performance in different down/distance situations, which allows us to compare model performance within the same situations as well as overall model performance across different situations. From this, we can tell that the model performance is fairly constant across these situations - random forest typically performs the best and logit the worst. In addition, we can see that playcalling becomes more predictable in later downs and longer distances. (Note: dotted line represents the average RMSE across all models and situations).
+```{r model-performance-downdist, echo=FALSE, message=FALSE, warning=FALSE, fig.align = "center"}
+validation_plus_phats %>% gather(key = "model", value = "phat", `logit`:`rf`) %>%
+    mutate(model = factor(model, levels = c("logit", "loess", "rpart", "knn", "rf")),
+           distance = case_when(
+               ydstogo < 3 ~ "Short",
+               ydstogo > 8 ~ "Long",
+               TRUE ~ "Medium"
+           ) %>% factor(levels = c("Short", "Medium", "Long"))) %>%
+    group_by(model, down, distance) %>%
+    summarize(RMSE = RMSE(phat, pass_attempt)) %>%
+    ggplot(aes(x = down, y = RMSE, fill = model)) +
+    geom_bar(stat = "identity", color = "black", position = "dodge", width = 0.7) +
+    scale_fill_brewer(palette = "RdYlGn") + 
+    coord_cartesian(ylim = c(0, 0.6)) +
+    facet_grid(distance~.) + 
+    ggtitle("Model Performance across Down/Distance Situations") +
+    geom_hline(yintercept = mean(validation_results_summary$RMSE[2:6]), linetype = "dotted")
+```
+
+
+Another interesting thing to consider is the relationship between an offense's playcall unpredictability and the team's overall success, measured in terms of win percentage during the 2019 season. In the plot below, there seems to be a moderately strong, positive linear relationship between these variables, which suggests a team's expected success increases with more unpredictability. It would therefore be in a team's best interest to be unpredictable, though there are two small clusters of teams that are exceptions: New Orleans, Kansas City, and New England (top left) are predictable yet have good win-loss records; Miami, Detroit, and Cincinnati (bottom right) are unpredictable but with poor win-loss records. Virtually all other teams fall within a clear, upward-sloping band with greater variation toward the unpredictable end of the spectrum. 
+```{r unpredictability-win-pct, echo=FALSE, message=FALSE, warning=FALSE, fig.align = "center"}
+# Creating dataframe of 2019 season home wins for each team
+home_record_2019 <- pbp_original %>%
+  select(old_game_id, season, home_team, away_team, home_score, away_score, season, season_type) %>%
+  filter(season == 2019 & season_type == "REG") %>%
+  group_by(old_game_id) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  group_by(home_team) %>%
+  summarize(home_wins = sum(home_score > away_score),
+            home_losses = sum(home_score < away_score),
+            home_ties = sum(home_score == away_score)) %>%
+  rename(team = home_team)
+
+# Creating dataframe of 2019 season away wins for each team
+away_record_2019 <- pbp_original %>%
+  select(old_game_id, home_team, away_team, home_score, away_score, season, season_type) %>%
+  filter(season == 2019 & season_type == "REG") %>% 
+  group_by(old_game_id) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  group_by(away_team) %>%
+  summarize(away_wins = sum(away_score > home_score),
+            away_losses = sum(away_score < home_score),
+            away_ties = sum(away_score == home_score)) %>%
+  rename(team = away_team)
+
+# Combining home and away wins to find overall win percentage by team
+win_pct_2019 <- inner_join(home_record_2019, away_record_2019, by = "team") %>%
+  group_by(team) %>%
+  summarize(win_pct = (home_wins + away_wins)/(home_wins + away_wins + home_losses + away_losses))
+
+rm(home_record_2019, away_record_2019)
+
+# Plotting win percentage against model's RMSE for each team
+validation_plus_phats %>%
+    group_by(posteam) %>%
+    summarize(rmse = RMSE(rf, pass_attempt)) %>%
+    rename(team = posteam) %>%
+    inner_join(win_pct_2019, by = "team") %>%
+    ggplot(aes(x = rmse, y = win_pct)) +
+    geom_vline(xintercept = median(validation_plus_phats %>% summarize(rmse = RMSE(rf, pass_attempt)) %>% pull(rmse)), linetype = "dotted") +
+    geom_hline(yintercept = 0.5, linetype = "dotted") +
+    geom_label(aes(label = team, fill = team), position = position_dodge2(width = 1), size = 3) +
+    xlab("Offense Playcall Unpredictability (RMSE)") +
+    ylab("Team Win %") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = "Offense Playcall Unpredictability vs. Team Win Percentage",
+         subtitle = "2019 NFL Season") +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+
+We saw that the random forest model was able to reduce the 50/50 baseline predictions RMSE by 19% and the naive predictions by 16%. What is the significance of this improvement? To answer this question, we will use a new dataset of plays from the 2017 NFL season made available by the NFL Operations Team in connection with its annual Big Data Bowl competition. This includes new information on defenses which the original `nflfastR` data lacked. Using this information, we can infer whether defenses utilized a pass, run, or standard (hybrid) defense and compare these de facto predictions against the true outcomes to determine a baseline for how well NFL teams actually predict plays. We can then use our random forest model to make our own probability estimates, then formulate a decision rule that would make the predictions strictly better than the NFL baseline.
+
+The two key features we use to infer the style of a given defense (i.e. pass/run/standard) are the number of defensive backs, smaller, faster players who cover the offense's receivers; and number of defenders positioned in "the box," a rectangular area spanning the width of the offensive line and running about 3-5 yards deep into the defense's side of the line of scrimmage. More defensive backs on the field means the defense is expecting a pass, whereas more defenders in the box means the defense is expecting a run. Below is the distribution of defensive back/box defender combinations.
+```{r loading-preprocessing-newdata, echo=FALSE, warning=FALSE}
+# Loading new dataset - this one has information on defenses that the previous dataset did not
+plays2017_original <- read.csv("https://raw.githubusercontent.com/nfl-football-ops/Big-Data-Bowl/master/Data/plays.csv")
+
+# Reshaping data
+plays2017 <- plays2017_original %>%
+  filter(isPenalty == 0 & isSTPlay == 0) %>%
+  select(gameId, playId, defendersInTheBox, personnel.defense, PassResult, PlayResult, playDescription) %>%
+  mutate(game_play_id = paste(gameId, playId, sep = "_")) %>%
+  select(-gameId, -playId) %>%
+  rename(defenders_in_box = defendersInTheBox, defense_personnel = personnel.defense,
+         play_result = PassResult, gain_loss = PlayResult, play_description = playDescription) %>%
+  mutate(offense_playcall = ifelse(is.na(play_result), "run", "pass"),
+         play_result = case_when(
+           play_result == "C" ~ "Completion",
+           play_result == "IN" ~ "Interception",
+           play_result == "I" ~ "Incomplete",
+           play_result == "S" ~ "Sack",
+           play_result == "R" ~ "QB Scramble",
+           is.na(play_result) ~ "Run"
+         )) %>%
+  separate(defense_personnel, into = c("num_DL", "num_LB", "num_DB"), sep = "\\, ") %>%
+  mutate(num_DL = as.numeric(str_extract(num_DL, "^\\d+")),
+         num_LB = as.numeric(str_extract(num_LB, "^\\d+")),
+         num_DB = as.numeric(str_extract(num_DB, "^\\d+")),
+         defenders_in_box = as.numeric(defenders_in_box),
+         gain_loss = as.numeric(gain_loss)) %>%
+  mutate(play_description = str_to_lower(play_description)) %>%
+  filter(!str_detect(play_description, "two-point conversion attempt")) %>%
+  select(-play_description) %>%
+  select(game_play_id, offense_playcall, play_result, gain_loss, defenders_in_box, num_DB) %>%
+  na.omit() %>%
+  mutate(defenders_in_box = case_when(
+    defenders_in_box >= 8 ~ "8 or more",
+    defenders_in_box <= 5 ~ "5 or fewer",
+    TRUE ~ as.character(defenders_in_box),
+  ),
+  defenders_in_box = factor(defenders_in_box, levels = c("5 or fewer", "6", "7", "8 or more")),
+  num_DB = case_when(
+    num_DB >= 6 ~ "6 or more",
+    num_DB <= 4 ~ "4 or fewer",
+    num_DB == 5 ~ "5"
+  ),
+  num_DB = factor(num_DB, levels = c("6 or more", "5", "4 or fewer"))) %>%
+  mutate(defense_style = case_when(
+    num_DB == "6 or more" ~ "pass",
+    num_DB == "5" & defenders_in_box == "5 or fewer" | num_DB == "5" & defenders_in_box == "6" ~ "pass",
+    num_DB == "4 or fewer" & defenders_in_box == "8 or more" ~ "run",
+    TRUE ~ "standard"
+  ))
+
+
+# Now merge this dataset with the corresponding nflfastR play-by-play data
+pbp_2017_original <- load_pbp(2017)
+col_index <- c(1,3,6,8,10,12,13,15,17,22,26,28,29,30,31,32,34,35,36,54,55,60,130,148,154,156,157,158,284,294,296,330,332,333)
+
+pbp_2017 <- pbp_2017_original[,col_index] %>%
+  mutate(game_date = ymd(game_date)) %>%
+  filter(game_date %within% interval(ymd("2017-09-01"), ymd("2017-12-31"))) %>%
+  select(-game_date) %>%
+  filter(play_type %in% c("pass", "run")) %>%
+  mutate(posteam = factor(posteam),
+         defteam = factor(defteam, levels = levels(posteam))) %>%
+  rename(second_half = game_half) %>%
+  mutate(second_half = ifelse(second_half == "Half2", 1, 0)) %>%
+  filter(qb_kneel == 0 & qb_spike == 0) %>%
+  select(-qb_kneel, -qb_spike) %>%
+  mutate(play_type = case_when(
+    play_type == "run" & qb_scramble == 1 ~ "pass",
+    TRUE ~ play_type
+  )) %>%
+  mutate(pass_attempt = ifelse(play_type == "pass", 1, 0)) %>%
+  select(-play_type, -qb_scramble) %>%
+  mutate(play_clock = as.numeric(play_clock)) %>%
+  filter(play_clock %in% 0:40) %>%
+  mutate(game_play_id = paste(old_game_id, play_id, sep = "_")) %>%
+  na.omit()
+
+plays2017 <- inner_join(plays2017, pbp_2017, by = "game_play_id")
+```
+
+```{r defense-combination-plot, echo=FALSE, message=FALSE, fig.align = "center"}
+plays2017 %>%
+    count(defenders_in_box, num_DB) %>%
+    mutate(`Combination Prevalence` = prop.table(n)) %>%
+    ggplot(aes(x = defenders_in_box, y = num_DB)) +
+    geom_tile(aes(fill = `Combination Prevalence`), color = "black") +
+    scale_fill_gradient2(low = "white", high = "red") + 
+    geom_label(aes(label = paste(round(`Combination Prevalence`,2)*100,"%", sep = ""))) +
+    theme_minimal() + 
+    xlab("Defenders in the Box") + 
+    ylab("Defensive Backs") +
+    theme(legend.position = "none",
+          panel.grid = element_blank()) +
+  ggtitle("Overall Frequency of Defensive Back/Box Defender Combinations")
+```
+
+
+We can categorize defense styles as pass, run, or standard based on these rates. To minimize error, we will categorize each defense as standard by default and only move observations into the run or pass category when their intended strategy is very clear - the upper right and lower left corners from the plot above.
+```{r defense-definitions, eval=FALSE}
+plays2017 <- plays2017 %>%
+  mutate(defense_style = case_when(
+    num_DB == "6 or more" ~ "pass",
+    num_DB == "5" & defenders_in_box == "5 or fewer" | num_DB == "5" & defenders_in_box == "6" ~ "pass",
+    num_DB == "4 or fewer" & defenders_in_box == "8 or more" ~ "run",
+    TRUE ~ "standard"
+  ))
+```
+
+
+We can summarize predictions and the actual outcomes in a sort of confusion matrix.
+```{r offense-playcall-defense-prediction, echo=FALSE, message=FALSE, fig.align = "center"}
+plays2017 %>% count(offense_playcall, defense_style) %>%
+    ggplot(aes(y = offense_playcall, x = factor(defense_style, levels = c("pass", "standard", "run")))) +
+    geom_tile(aes(fill = n), color = "black") +
+    scale_fill_gradient2(low = "white", high = "blue") + 
+    theme_minimal() +
+    xlab("Defense Style") +
+    ylab("Offense Playcall") +
+    ggtitle("Defense Style vs. Actual Offense Playcall") +
+    theme(legend.position = "none",
+          panel.grid = element_blank()) +
+    geom_label(aes(label = paste("n =", n)))
+```
+
+
+In total, there were 4,791 pass plays, of which 3,050 were correctly anticipated by the defense and 331 were incorrectly anticipated. A standard defense was utilized 1,410 times - this can be thought of as essentially a "non-prediction" in the sense that the defensive team must not have been certain enough of a pass or run to opt for a play-specific scheme. The same interpretation applies to run plays in the top row - there were 3,136 in total, of which 802 were correctly anticipated, etc. Overall, teams on defense predicted plays (utilized a non-standard defense) about 64% of the time and in these instances achieved an accuracy of 75%. We of course do not know what, if any, methodology teams use to estimate pass/run likelihood, nor do we know at what level of confidence is typically required to stray from a standard defense. What we do know, however, is that an alternative defensive play selection algorithm with the same level of accuracy but higher rate of predictions is strictly better; likewise, we know that an algorithm with the same prediction rate but greater accuracy is also strictly better. To this end, we can use our random forest model to make probability estimates on this same set of observations, then find the confidence level cutoffs, if any, that are in this zone. 
+
+```{r predicting-newdata-with-rf, warning=FALSE, message=FALSE}
+# Predicting pass probability for each play in the new dataset using the final random forest model
+phat_rf_2017 <- predict(fit_rf_final, plays2017)
+
+# Different confidence level cutoffs we will be used to determine predicting rate and accuracy
+# Confidence level = ratio  of distance from 0.5 (in absolute value) to 0.5 (max possible value)
+confidence_thresholds <- seq(0.01, 0.99, 0.01)
+
+# Each iteration of sapply() will return a prediction rate and accuracy level. These are stored in the object confidence_threshold_results.
+# Higher confidence cutoff means fewer predictions but more accuracy
+confidence_threshold_results <- sapply(confidence_thresholds, function(c){
+  
+  temp_df <- data.frame(offense_playcall = factor(plays2017$offense_playcall, levels = c("pass", "run")),
+                        phat_rf = phat_rf_2017)
+  
+  temp_df <- temp_df %>%
+    mutate(confidence = abs(phat_rf - 0.5)/0.5) %>%
+    filter(confidence >= c) %>%
+    mutate(rf_prediction = ifelse(phat_rf >= 0.5, "pass", "run") %>% factor(levels = c("pass", "run")))
+  
+  cm <- confusionMatrix(temp_df$rf_prediction, temp_df$offense_playcall)
+  
+  data.frame(overall_accuracy = cm$overall[["Accuracy"]],
+             num_predictions = nrow(temp_df))
+})
+
+# Reformatting results into dataframe
+confidence_threshold_results <- matrix(unlist(confidence_threshold_results), ncol = length(confidence_thresholds)) %>%
+  t() %>% 
+  as.data.frame() %>% 
+  rename(accuracy = V1, n_predictions = V2) %>%
+  mutate(confidence_threshold = confidence_thresholds,
+         prediction_rate = n_predictions / nrow(plays2017))
+```
+
+Finally, we can plot the results.
+```{r results-rf-predictions-newdata, echo=FALSE, warning=FALSE, fig.align = "center"}
+# Summarizing NFL predictions to find the baseline prediction rate and accuracy
+nfl_predictions <- plays2017 %>%
+  select(offense_playcall, defense_style) %>%
+  filter(defense_style != "standard") %>%
+  mutate(offense_playcall = factor(offense_playcall, levels = c("pass", "run")),
+         defense_style = factor(defense_style, levels = c("pass", "run")))
+
+# Confusion matrix for accuracy (and other metrics if necessary)
+cm_nfl_predictions <- confusionMatrix(nfl_predictions$defense_style, nfl_predictions$offense_playcall)
+
+# Storing rate of predictions in new object
+nfl_prediction_rate <- nrow(nfl_predictions) / nrow(plays2017)
+
+# We can see how different confidence thresholds translate to prediction rate/accuracy
+confidence_threshold_results %>%
+    ggplot(aes(x = prediction_rate, y = accuracy, color = confidence_thresholds)) + 
+    geom_point(size = 3) +
+    scale_color_gradient(low = "yellow", high = "dark green") +
+    geom_vline(xintercept = nrow(nfl_predictions)/nrow(plays2017), linetype = "dotted") +
+    geom_hline(yintercept = cm_nfl_predictions$overall[["Accuracy"]], linetype = "dotted") +
+    geom_label(label = "NFL Baseline", x = nrow(nfl_predictions)/nrow(plays2017), y = cm_nfl_predictions$overall[["Accuracy"]],
+               color = "black") +
+    xlab("Prediction Rate") +
+    ylab("Prediction Accuracy") +
+    labs(title = "Prediction Rate vs. Accuracy",
+         subtitle = "As a Function of Confidence Threshold") +
+    scale_x_continuous(labels = scales::percent) + 
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+```
+
+
+With our random forest model, all confidence thresholds between 0.05 and 0.31, inclusive, strictly dominate the NFL baseline. This range is represented by the hypotenuse of the right triangle the dotted lines make with the green-yellow line. In other words, when our model predicts a pass is between 47.5% and 52.5% likely, essentially a coin flip, we should always choose a standard defense. At the same time, a play-specific defensive style should always be utilized when our model predicts a pass/run probability of 65.5% or greater. The minimum threshold should never be set higher than this, or else too large a volume of predictions would be sacrificed for accuracy's sake. The final decision rule is summarized in the plot below.
+```{r rf-decision-rule, echo=FALSE, fig.align = "center"}
+rf_decision_rule <- data.frame(defense_style = c("Run", "Run or Standard", "Standard", "Pass or Standard", "Pass"),
+                               bar_size = c(0.345, 0.13, 0.05, 0.13, 0.345),
+                               placeholder_column = rep("placeholder", 5),
+                               midpoints = c(median(c(0, 0.345)), median(c(0.345, 0.475)), 0.5, median(c(0.525, 0.655)), median(c(0.655, 1)))) %>%
+  mutate(defense_style = factor(defense_style, levels = c("Pass", "Pass or Standard", "Standard", "Run or Standard", "Run")))
+
+rf_decision_rule %>%
+  ggplot(aes(x = placeholder_column, y = bar_size, fill = defense_style)) +
+  geom_bar(stat = "identity", position = "stack", color = "black", width = 0.4) + 
+  scale_fill_brewer(palette = "RdYlBu") +
+  xlab("") +
+  ylab("Pass Probability") + 
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1), breaks = c(0, 0.345, 0.475, 0.525, 0.655, 1)) +
+  geom_hline(linetype = "dotted", yintercept = 0.345) +
+  geom_hline(linetype = "dotted", yintercept = 0.475) + 
+  geom_hline(linetype = "dotted", yintercept = 0.525) +
+  geom_hline(linetype = "dotted", yintercept = 0.655) + 
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.text.x = element_blank(),
+        legend.position = "none") + 
+  geom_text(aes(label = defense_style, y = midpoints)) +
+  ggtitle("Optimal Defensive Strategy per Model Pass Probability Estimate")
+
+```
+
+# CONCLUSION
+Most NFL coaches would probably say offensive playcalling is more art than science - that they rely on "feel" above all else to make decisions, taking into account a wide range of variables at once but ultimately making decisions according to instinct. This project essentially endeavors to reverse engineer a science, a formalized framework of decision-making, out of these instincts in order to predict future outcomes. A team that could do so effectively would gain a significant strategic advantage over its competition, win more games, and ultimately yield commercial success to the franchise.  
+
+Some factors weigh more heavily on playcalling decisions, such as the `down` and `ydstogo`. Anyone who follows football knows this already. Using only these several highly predictive features, we can build models which account for much of the variation in the outcomes. However, to further reduce the prediction errors more complex, flexible models that can accommodate many variables at once are necessary. We saw that a random forest model fit the data best among these models. 
+
+To contextualize the significance of the random forest model's performance, we inferred actual playcalling predictions from a new dataset. We assumed there are exactly three types of defensive strategies - run, pass, and standard - and determined which ones were being employed on a given play based on the number of defensive backs on the field and number of defenders positioned in the box. We also assumed these strategies were chosen based on prediction confidence level, meaning teams opted for a run/pass defense when they were sufficiently certain of the outcome and otherwise opted for a standard defense. Using this same methodology, we made probability estimates on the new data with the random forest model and tested many different confidence level cutoffs to determine a decision rule that strictly dominated the NFL baseline. "Strictly dominate" in this context meant predicting at least as many times (i.e. not defaulting to a standard defense) and with at least as high accuracy. 
+
+One major limitation of this work is the potential lack of important features which could have helped reduce error without fundamentally changing the models themselves. For example, `shotgun` proved to have strong predictive value. There are many other offensive formations than shotgun, however such information was not available in the dataset. Another limitation of the work is that the models all assume plays are independent of each other - the outcome of one observation does not change our expectation of another. This may not be true in practice. When game situations allow for it, teams generally try to alternate passes and runs. Lastly, using the random forest model to make real-time decisions may not be feasible because some of the features by definition cannot be known until the moment the play begins, such as `play_clock` and `half_seconds_remaining`. 
+
+Besides wrangling data to include new features and potentially improve the underlying models, there are two different paths future work could take, and these paths hinge on the question of whether the risk/reward of predicting playcalling decisions incorrectly/correctly is the same across all game situations and possible combinations of defensive style/offense playcall. The work in this project assumes the answer is yes. Operating under this assumption, the decision rule we arrived at is designed specifically to dominate the NFL prediction baseline. While there probably is no ambiguity that, all things equal, improving prediction rate and/or accuracy can only increase a team's chance of success, it may be possible that the optimal balance of prediction rate and accuracy achievable by our model lies somewhere else along the green-yellow curve we plotted. Future work would entail finding this optimal balance. 
+
+In reality the risks and rewards of different defensive schemes probably varies significantly. Matching up the correct type of defense matters more in a fourth and goal situation than it does on third and long at midfield; similarly, calling a run defense against a pass play is probably a more penalizing error than calling a standard defense against a pass play. If this is the case, it means our decision rule is dynamic rather than rigid (changes according to game situations) and asymmetrical rather than symmetrical (requires different levels of confidence to choose pass/run defenses). This would not change the probability estimation model itself but would indeed change how a team should act on it. Future work would include constructing a more sophisticated decision rule around this idea.
